@@ -2,6 +2,9 @@
 
 #include <windows.h>
 #include <string>
+#include <map>
+#include <fstream>
+#include <vector>
 
 namespace hooks::device {
     extern bool ENABLE;
@@ -57,12 +60,10 @@ public:
 
 class MITMHandle : public CustomHandle {
 protected:
-    LPCWSTR lpFileName = L"";
-    bool lpFileNameContains = false;
-    std::string rec_file = "";
-
+    std::map<HANDLE, size_t> offset;
+    std::wstring crypt_folder;
 public:
-    MITMHandle(LPCWSTR lpFileName, std::string rec_file = "", bool lpFileNameContains = false);
+    MITMHandle();
 
     bool open(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
               LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,

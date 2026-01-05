@@ -8,6 +8,21 @@
 #include "util/utils.h"
 
 #include <tlhelp32.h>
+#include <map>
+#include <windows.h>
+#include <fstream>
+#include <string>
+#include <algorithm>
+
+#include <iostream>
+#include <filesystem>
+#include <iomanip>
+#include <sstream>
+#include <cstring>
+
+#include <openssl/aes.h>
+#include <openssl/rand.h>
+#include <openssl/evp.h>
 
 // std::min
 #ifdef min
@@ -43,32 +58,499 @@ static decltype(WriteFile) *WriteFile_orig = nullptr;
 
 static std::vector<CustomHandle *> CUSTOM_HANDLES;
 
-MITMHandle::MITMHandle(LPCWSTR lpFileName, std::string rec_file, bool lpFileNameContains) {
-    this->lpFileName = lpFileName;
-    this->rec_file = rec_file;
-    this->lpFileNameContains = lpFileNameContains;
-    this->com_pass = true;
+namespace fs = std::filesystem;
+
+class AESCrypto {
+public:    
+    static const int IV_SIZE = 16; // 128-bit IV
+
+private:
+    std::string key;
+    std::string iv;
+    static const int AES_KEY_SIZE = 256; // 256-bit AES
+
+    // 从字符串生成固定长度的key
+    std::vector<BYTE> generateFixedKey(const std::string& inputKey) {
+        std::vector<BYTE> fixedKey(32); // 256-bit key = 32 bytes
+        
+        if (inputKey.empty()) {
+            // 默认key
+            std::string defaultKey = "MaoMaNiAESEncryptionKey2024";
+            for (size_t i = 0; i < 32; i++) {
+                fixedKey[i] = defaultKey[i % defaultKey.size()];
+            }
+        } else {
+            // 使用PBKDF2派生密钥
+            std::vector<BYTE> salt = {0x73, 0x61, 0x6C, 0x74, 0x53, 0x61, 0x6C, 0x74}; // "saltSalt"
+            
+            PKCS5_PBKDF2_HMAC_SHA1(
+                inputKey.c_str(), inputKey.length(),
+                salt.data(), salt.size(),
+                10000, // 迭代次数
+                32,    // 输出密钥长度
+                fixedKey.data()
+            );
+        }
+        
+        return fixedKey;
+    }
+
+    // 生成随机IV
+    std::vector<BYTE> generateIV() {
+        std::vector<BYTE> iv(IV_SIZE);
+        RAND_bytes(iv.data(), IV_SIZE);
+        return iv;
+    }
+
+public:
+    AESCrypto(const std::string& k = "MaoMaNi") : key(k) {
+        // 生成固定长度的key和随机IV
+        auto fixedKey = generateFixedKey(k);
+        key = std::string(fixedKey.begin(), fixedKey.end());
+        
+        auto ivBytes = generateIV();
+        iv = std::string(ivBytes.begin(), ivBytes.end());
+    }
+    
+    // 获取当前IV（用于需要存储IV的情况）
+    std::string getIV() const {
+        return iv;
+    }
+    
+    // 设置特定IV（用于解密已知IV的数据）
+    void setIV(const std::string& newIv) {
+        if (newIv.size() == IV_SIZE) {
+            iv = newIv;
+        }
+    }
+    
+    // 加密数据
+    bool encryptData(const BYTE* plaintext, size_t plaintext_len, 
+                     std::vector<BYTE>& ciphertext) {
+        try {
+            EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+            if (!ctx) return false;
+            
+            // 使用AES-256-CBC模式
+            if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, 
+                                  reinterpret_cast<const unsigned char*>(key.c_str()),
+                                  reinterpret_cast<const unsigned char*>(iv.c_str())) != 1) {
+                EVP_CIPHER_CTX_free(ctx);
+                return false;
+            }
+            
+            // 计算输出缓冲区大小（需要填充）
+            ciphertext.resize(plaintext_len + AES_BLOCK_SIZE);
+            int len;
+            int ciphertext_len;
+            
+            // 加密数据
+            if (EVP_EncryptUpdate(ctx, ciphertext.data(), &len,
+                                 plaintext, plaintext_len) != 1) {
+                EVP_CIPHER_CTX_free(ctx);
+                return false;
+            }
+            ciphertext_len = len;
+            
+            // 完成加密（处理填充）
+            if (EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len) != 1) {
+                EVP_CIPHER_CTX_free(ctx);
+                return false;
+            }
+            ciphertext_len += len;
+            
+            // 调整到实际大小
+            ciphertext.resize(ciphertext_len);
+            
+            EVP_CIPHER_CTX_free(ctx);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+    
+    // 解密数据
+    bool decryptData(const BYTE* ciphertext, size_t ciphertext_len,
+                     std::vector<BYTE>& plaintext) {
+        try {
+            EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+            if (!ctx) return false;
+            
+            if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL,
+                                  reinterpret_cast<const unsigned char*>(key.c_str()),
+                                  reinterpret_cast<const unsigned char*>(iv.c_str())) != 1) {
+                EVP_CIPHER_CTX_free(ctx);
+                return false;
+            }
+            
+            plaintext.resize(ciphertext_len);
+            int len;
+            int plaintext_len;
+            
+            if (EVP_DecryptUpdate(ctx, plaintext.data(), &len,
+                                 ciphertext, ciphertext_len) != 1) {
+                EVP_CIPHER_CTX_free(ctx);
+                return false;
+            }
+            plaintext_len = len;
+            
+            if (EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len) != 1) {
+                EVP_CIPHER_CTX_free(ctx);
+                return false;
+            }
+            plaintext_len += len;
+            
+            plaintext.resize(plaintext_len);
+            
+            EVP_CIPHER_CTX_free(ctx);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+    
+    // 保持原有接口兼容性
+    void encryptToBuffer(LPVOID lpBuffer, size_t size, size_t fileOffset = 0) {
+        BYTE* data = static_cast<BYTE*>(lpBuffer);
+        std::vector<BYTE> plaintext(data, data + size);
+        std::vector<BYTE> ciphertext;
+        
+        if (encryptData(plaintext.data(), size, ciphertext)) {
+            // 确保不超过原始缓冲区大小
+            size_t copySize = std::min(ciphertext.size(), size);
+            memcpy(data, ciphertext.data(), copySize);
+            
+            // 如果加密后数据更大，用0填充剩余部分
+            if (copySize < size) {
+                memset(data + copySize, 0, size - copySize);
+            }
+        }
+    }
+    
+    void decryptFromBuffer(LPVOID lpBuffer, size_t size, size_t fileOffset = 0) {
+        BYTE* data = static_cast<BYTE*>(lpBuffer);
+        std::vector<BYTE> ciphertext(data, data + size);
+        std::vector<BYTE> plaintext;
+        
+        if (decryptData(ciphertext.data(), size, plaintext)) {
+            size_t copySize = std::min(plaintext.size(), size);
+            memcpy(data, plaintext.data(), copySize);
+            
+            if (copySize < size) {
+                memset(data + copySize, 0, size - copySize);
+            }
+        }
+    }
+
+        // 加密字符串（返回原始字节）
+    std::vector<unsigned char> encryptString(const std::string& plaintext) {
+        std::vector<unsigned char> plaintextBytes(plaintext.begin(), plaintext.end());
+        std::vector<unsigned char> ciphertext;
+        
+        if (encryptData(plaintextBytes.data(), plaintextBytes.size(), ciphertext)) {
+            // 返回：IV + 密文
+            std::vector<unsigned char> result(iv.begin(), iv.end());
+            result.insert(result.end(), ciphertext.begin(), ciphertext.end());
+            return result;
+        }
+        
+        return std::vector<unsigned char>();
+    }
+    
+    // 解密字节数据为字符串
+    std::string decryptBytes(const std::vector<unsigned char>& encryptedData) {
+        if (encryptedData.size() <= IV_SIZE) {
+            return "";
+        }
+        
+        // 分离IV和密文
+        std::string extractedIV(encryptedData.begin(), encryptedData.begin() + IV_SIZE);
+        std::vector<unsigned char> ciphertext(encryptedData.begin() + IV_SIZE, encryptedData.end());
+        
+        // 设置IV
+        setIV(extractedIV);
+        
+        // 解密
+        std::vector<unsigned char> plaintext;
+        if (decryptData(ciphertext.data(), ciphertext.size(), plaintext)) {
+            return std::string(plaintext.begin(), plaintext.end());
+        }
+        
+        return "";
+    }
+
+    static std::string bytesToHex(const std::vector<unsigned char>& data) {
+        std::ostringstream hexStream;
+        hexStream << std::hex << std::setfill('0');
+        
+        for (unsigned char c : data) {
+            hexStream << std::setw(2) << static_cast<int>(c);
+        }
+        
+        return hexStream.str();
+    }
+    
+    // HEX转字节
+    static std::vector<unsigned char> hexToBytes(const std::string& hex) {
+        std::vector<unsigned char> bytes;
+        
+        if (hex.length() % 2 != 0) {
+            return bytes;
+        }
+        
+        bytes.reserve(hex.length() / 2);
+        
+        for (size_t i = 0; i < hex.length(); i += 2) {
+            std::string byteString = hex.substr(i, 2);
+            unsigned char byte = static_cast<unsigned char>(strtol(byteString.c_str(), nullptr, 16));
+            bytes.push_back(byte);
+        }
+        
+        return bytes;
+    }
+
+    std::string encryptFilename(const std::string& filename) {
+        std::vector<unsigned char> encryptedBytes = encryptString(filename);
+        if (encryptedBytes.empty()) {
+            return filename;
+        }
+        
+        return AESCrypto::bytesToHex(encryptedBytes);
+    }
+    
+    std::string decryptFilename(const std::string& encryptedFilename) {
+        std::vector<unsigned char> encryptedBytes = AESCrypto::hexToBytes(encryptedFilename);
+        if (encryptedBytes.empty()) {
+            return encryptedFilename;
+        }
+        
+        std::string decryptedName = decryptBytes(encryptedBytes);
+        if (decryptedName.empty()) {
+            return encryptedFilename;
+        }
+
+        return decryptedName;
+    }
+};
+
+// 文件加密工具类
+class FileEncryptor {
+private:
+    AESCrypto crypto;
+    
+public:
+    FileEncryptor(const std::string& key = "MaoMaNi") : crypto(key) {}
+    
+    // 加密单个文件
+    bool encryptFile(const std::string& folderPath, const std::string& filePath) {
+        try {
+            // 读取文件
+            std::ifstream file(filePath, std::ios::binary);
+            if (!file) {
+                std::cerr << "无法打开文件: " << filePath << std::endl;
+                return false;
+            }
+            
+            file.seekg(0, std::ios::end);
+            size_t fileSize = file.tellg();
+            file.seekg(0, std::ios::beg);
+            
+            std::vector<BYTE> buffer(fileSize);
+            file.read(reinterpret_cast<char*>(buffer.data()), fileSize);
+            file.close();
+            
+            // 加密数据
+            std::vector<BYTE> encryptedData;
+            if (!crypto.encryptData(buffer.data(), fileSize, encryptedData)) {
+                std::cerr << "加密失败: " << filePath << std::endl;
+                return false;
+            }
+            
+            std::string encryptedPath = filePath.substr(folderPath.length());
+            std::string encryptedName = crypto.encryptFilename(encryptedPath);
+            std::string encryptedFullPath = folderPath + encryptedName;
+            // 写入文件（添加.enc扩展名）
+            std::ofstream outFile(encryptedFullPath, std::ios::binary);
+            if (!outFile) {
+                std::cerr << "无法创建加密文件: " << encryptedPath << std::endl;
+                return false;
+            }
+            
+            // 写入IV（前16字节）
+            std::string iv = crypto.getIV();
+            outFile.write(iv.c_str(), iv.size());
+            
+            // 写入加密数据
+            outFile.write(reinterpret_cast<const char*>(encryptedData.data()), 
+                         encryptedData.size());
+            outFile.close();
+            
+            // 删除原始文件
+            // fs::remove(filePath);
+            
+            std::cout << "加密完成: " << filePath << " -> " << encryptedPath << std::endl;
+            return true;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "加密文件异常: " << filePath << " - " << e.what() << std::endl;
+            return false;
+        }
+    }
+    
+    // 解密单个文件
+    bool decryptFile(const std::string& folderPath, const std::string& filePath) {
+        try {
+            std::ifstream file(filePath, std::ios::binary);
+            if (!file) {
+                std::cerr << "无法打开文件: " << filePath << std::endl;
+                return false;
+            }
+            
+
+            file.seekg(0, std::ios::end);
+            size_t fileSize = file.tellg();
+            file.seekg(0, std::ios::beg);
+            
+            // 读取IV（前16字节）
+            std::vector<BYTE> iv(AESCrypto::IV_SIZE);
+            file.read(reinterpret_cast<char*>(iv.data()), iv.size());
+            
+            // 读取加密数据
+            size_t dataSize = fileSize - iv.size();
+            std::vector<BYTE> encryptedData(dataSize);
+            file.read(reinterpret_cast<char*>(encryptedData.data()), dataSize);
+            file.close();
+            
+            // 设置IV并解密
+            crypto.setIV(std::string(iv.begin(), iv.end()));
+            std::vector<BYTE> decryptedData;
+            
+            if (!crypto.decryptData(encryptedData.data(), dataSize, decryptedData)) {
+                std::cerr << "解密失败: " << filePath << std::endl;
+                return false;
+            }
+            
+            std::string decryptedName = crypto.decryptFilename(filePath.substr(folderPath.length()));
+            std::string fullPath = folderPath + fs::path(decryptedName).parent_path().generic_string();
+            
+            if (!fs::exists(fullPath) && fs::create_directories(fullPath)) {
+                std::cerr << "无法创建目录: " << fullPath << std::endl;
+                return false;
+            }
+
+            std::ofstream outFile(folderPath + decryptedName, std::ios::binary);
+            
+            if (!outFile) {
+                std::cerr << "无法创建解密文件: " << folderPath + decryptedName << std::endl;
+                return false;
+            }
+            
+            outFile.write(reinterpret_cast<const char*>(decryptedData.data()), 
+                         decryptedData.size());
+            outFile.close();
+            
+            // 删除加密文件
+            // fs::remove(filePath);
+            
+            std::cout << "解密完成: " << filePath << " -> " << decryptedName << std::endl;
+            return true;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "解密文件异常: " << filePath << " - " << e.what() << std::endl;
+            return false;
+        }
+    }
+    
+    bool encryptFolder(const std::string& folderPath) {
+        try {
+            if (!fs::exists(folderPath) || !fs::is_directory(folderPath)) {
+                std::cerr << "无效的文件夹路径: " << folderPath << std::endl;
+                return false;
+            }
+            
+            int successCount = 0;
+            int totalCount = 0;
+
+            for (const auto& entry : fs::recursive_directory_iterator(folderPath)) {
+                if (fs::is_regular_file(entry.path())) {
+                    totalCount++;
+                    std::string filePath = entry.path().string();
+                    if (encryptFile(folderPath, filePath)) {
+                        successCount++;
+                    }
+                }
+            }
+            
+            std::cout << "文件夹加密完成: " << folderPath << std::endl;
+            std::cout << "成功: " << successCount << "/" << totalCount << " 个文件" << std::endl;
+            return successCount > 0;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "遍历文件夹异常: " << folderPath << " - " << e.what() << std::endl;
+            return false;
+        }
+    }
+
+    // decryptFolder也要类似修改
+    bool decryptFolder(const std::string& folderPath) {
+        try {
+            if (!fs::exists(folderPath) || !fs::is_directory(folderPath)) {
+                std::cerr << "无效的文件夹路径: " << folderPath << std::endl;
+                return false;
+            }
+            
+            int successCount = 0;
+            int totalCount = 0;
+            
+            for (const auto& entry : fs::recursive_directory_iterator(folderPath)) {
+                if (fs::is_regular_file(entry.path())) {
+                    std::string filePath = entry.path().string();
+                    if (decryptFile(folderPath, filePath)) {
+                        successCount++;
+                    }
+                }
+            }
+            
+            std::cout << "文件夹解密完成: " << folderPath << std::endl;
+            std::cout << "成功: " << successCount << "/" << totalCount << " 个文件" << std::endl;
+            return successCount > 0;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "遍历文件夹异常: " << folderPath << " - " << e.what() << std::endl;
+            return false;
+        }
+    }
+};
+
+AESCrypto g_AESCrypto;
+
+MITMHandle::MITMHandle() {
+    crypt_folder = L"crypt\\";
 }
 
 bool MITMHandle::open(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
                       LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
                       DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) {
 
-    // check if file name matches
-    if (this->lpFileNameContains) {
-        if (wcsstr(lpFileName, this->lpFileName) == 0)
-            return false;
-    } else {
-        if (wcscmp(lpFileName, this->lpFileName))
-            return false;
+    std::string originalFileName = ws2s(lpFileName);
+
+    std::wstring cryptFile = crypt_folder + s2ws(g_AESCrypto.encryptFilename(originalFileName));
+
+    if (fs::exists(cryptFile)) {
+        log_warning("devicehook", "Using encrypted file {} for {}", originalFileName, ws2s(cryptFile));
+        lpFileName = cryptFile.c_str();
+    }else {
+        return false;
     }
 
-    // create our own file handle
     handle = CreateFileW_orig(lpFileName, dwDesiredAccess, dwShareMode,
                          lpSecurityAttributes, dwCreationDisposition,
                          dwFlagsAndAttributes, hTemplateFile);
 
-    // check if it worked - if not device hook will try again without us
+    if (handle != INVALID_HANDLE_VALUE) {
+        offset[handle] = 0;
+    }
+
     return handle != INVALID_HANDLE_VALUE;
 }
 
@@ -76,48 +558,32 @@ int MITMHandle::read(LPVOID lpBuffer, DWORD nNumberOfBytesToRead) {
     DWORD lpNumberOfBytesRead = 0;
     auto res = ReadFile_orig(handle, lpBuffer, nNumberOfBytesToRead,
             &lpNumberOfBytesRead, NULL);
+    
     if (res) {
-
-        // record
-        log_info("mitm", "read: {}", bin2hex((uint8_t*) lpBuffer, lpNumberOfBytesRead));
-
-        // pass
+        if (lpNumberOfBytesRead == 0) {
+            return 0;
+        }
+        g_AESCrypto.decryptFromBuffer(lpBuffer, lpNumberOfBytesRead, offset[handle]);
+        
+        offset[handle] += lpNumberOfBytesRead;
         return lpNumberOfBytesRead;
     } else {
+        DWORD error = GetLastError();
+        
+        if (error == ERROR_HANDLE_EOF) {
+            return 0;
+        }
+
         return -1;
     }
 }
 
 int MITMHandle::write(LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite) {
-    DWORD lpNumberOfBytesWritten = 0;
-    auto res = WriteFile_orig(handle, lpBuffer, nNumberOfBytesToWrite,
-            &lpNumberOfBytesWritten, NULL);
-    if (res) {
-
-        // record
-        log_info("mitm", "write: {}", bin2hex((uint8_t*) lpBuffer, lpNumberOfBytesWritten));
-
-        // pass
-        return lpNumberOfBytesWritten;
-    } else {
-        return -1;
-    }
+    return -1;
 }
 
-int MITMHandle::device_io(DWORD dwIoControlCode, LPVOID lpInBuffer,
-        DWORD nInBufferSize, LPVOID lpOutBuffer, DWORD nOutBufferSize) {
-    DWORD lpBytesReturned = 0;
-    auto res = DeviceIoControl_orig(handle, dwIoControlCode, lpInBuffer, nInBufferSize,
-            lpOutBuffer, nOutBufferSize, &lpBytesReturned, NULL);
-    if (res) {
-
-        // record
-        log_info("mitm", "device_io");
-
-        return lpBytesReturned;
-    } else {
-        return -1;
-    }
+int MITMHandle::device_io(DWORD dwIoControlCode, LPVOID lpInBuffer, DWORD nInBufferSize, LPVOID lpOutBuffer, DWORD nOutBufferSize) {
+    return -1;
 }
 
 size_t MITMHandle::bytes_available() {
@@ -127,6 +593,8 @@ size_t MITMHandle::bytes_available() {
 }
 
 bool MITMHandle::close() {
+    offset[handle] = 0;
+    offset.erase(handle);
     return CloseHandle_orig(handle);
 }
 
@@ -550,16 +1018,16 @@ void devicehook_init(HMODULE module) {
     } \
 }
 
-    /*
+    
     // initialize only once
     static bool initialized = false;
     if (initialized) {
         return;
     } else {
         initialized = true;
+        devicehook_add(new MITMHandle());
     }
-    */
-
+    
     log_info("devicehook", "init");
 
     suspend_or_resume_other_threads(true);

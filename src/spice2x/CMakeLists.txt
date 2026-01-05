@@ -10,8 +10,59 @@ set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 # niceities for vscode
 set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
 
+find_package(OpenSSL REQUIRED)
+
+set(CMAKE_TOOLCHAIN_FILE "$ENV{HOME}/opt/vcpkg/scripts/buildsystems/vcpkg.cmake")
+set(VCPKG_TARGET_TRIPLET "x64-mingw-static")
+
+set(OPENSSL_USE_STATIC_LIBS ON)
+set(CMAKE_FIND_LIBRARY_SUFFIXES .lib .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
+
+message(STATUS "========================================")
+message(STATUS "OpenSSL Configuration:")
+message(STATUS "  Version: ${OPENSSL_VERSION}")
+message(STATUS "  Include dir: ${OPENSSL_INCLUDE_DIR}")
+message(STATUS "  SSL library: ${OPENSSL_SSL_LIBRARY}")
+message(STATUS "  Crypto library: ${OPENSSL_CRYPTO_LIBRARY}")
+message(STATUS "  Libraries: ${OPENSSL_LIBRARIES}")
+
+if(OPENSSL_USE_STATIC_LIBS)
+    message(STATUS "Using static OpenSSL libraries")
+else()
+    message(STATUS "WARNING: May be using dynamic OpenSSL libraries")
+endif()
+
+function(check_static_library lib_path result_var)
+    if(lib_path)
+        get_filename_component(lib_name ${lib_path} NAME)
+        if(lib_name MATCHES ".*_static\.(a|lib)$" OR 
+           lib_name MATCHES ".*\.(a|lib)$" AND NOT lib_name MATCHES ".*\.dll\.(a|lib)$")
+            set(${result_var} TRUE PARENT_SCOPE)
+        else()
+            set(${result_var} FALSE PARENT_SCOPE)
+        endif()
+    else()
+        set(${result_var} FALSE PARENT_SCOPE)
+    endif()
+endfunction()
+
+check_static_library(${OPENSSL_SSL_LIBRARY} IS_SSL_STATIC)
+check_static_library(${OPENSSL_CRYPTO_LIBRARY} IS_CRYPTO_STATIC)
+
+if(IS_SSL_STATIC AND IS_CRYPTO_STATIC)
+    message(STATUS "✓ Confirmed: Using static OpenSSL libraries")
+else()
+    message(WARNING "⚠ Warning: May not be using static OpenSSL libraries")
+    message(WARNING "  SSL static: ${IS_SSL_STATIC}")
+    message(WARNING "  Crypto static: ${IS_CRYPTO_STATIC}")
+endif()
+
+message(STATUS "========================================")
+
 # for RapidJSON
 add_compile_definitions(RAPIDJSON_HAS_STDSTRING)
+
+set(CMAKE_FIND_LIBRARY_SUFFIXES .lib .a)
 
 if(MSVC)
     # disable intermediate manifest
@@ -172,6 +223,8 @@ else()
         # file prefix map for relative working directory
         set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -ffile-prefix-map=${CMAKE_SOURCE_DIR}=.")
         set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -ffile-prefix-map=${CMAKE_SOURCE_DIR}=.")
+		
+		set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -lssl -lcrypto -static")
     endif()
 
     # release with debug info flags
@@ -635,10 +688,11 @@ set(RESOURCE_FILES build/manifest.manifest build/manifest.rc build/icon.rc cfg/W
 add_executable(spicetools_spice ${SOURCE_FILES} ${RESOURCE_FILES})
 target_link_libraries(spicetools_spice
         PUBLIC d3d9 ws2_32 version comctl32 shlwapi iphlpapi hid secur32 setupapi psapi winmm winhttp
-        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features)
+        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features ${OPENSSL_LIBRARIES} OpenSSL::SSL ws2_32 crypt32)
 target_link_libraries(spicetools_spice PUBLIC winscard)
 set_target_properties(spicetools_spice PROPERTIES PREFIX "")
 set_target_properties(spicetools_spice PROPERTIES OUTPUT_NAME "spice")
+
 
 IF(NOT MSVC)
     set_target_properties(spicetools_spice PROPERTIES COMPILE_FLAGS "-m32" LINK_FLAGS "-m32")
@@ -651,7 +705,7 @@ set(RESOURCE_FILES build/manifest.manifest build/manifest.rc build/icon.rc cfg/W
 add_executable(spicetools_spice_laa ${SOURCE_FILES} ${RESOURCE_FILES})
 target_link_libraries(spicetools_spice_laa
         PUBLIC d3d9 ws2_32 version comctl32 shlwapi iphlpapi hid secur32 setupapi psapi winmm winhttp
-        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features)
+        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features ${OPENSSL_LIBRARIES} OpenSSL::SSL ws2_32 crypt32)
 target_link_libraries(spicetools_spice_laa PUBLIC winscard)
 set_target_properties(spicetools_spice_laa PROPERTIES PREFIX "")
 set_target_properties(spicetools_spice_laa PROPERTIES OUTPUT_NAME "spice_laa")
@@ -668,7 +722,7 @@ set(RESOURCE_FILES build/manifest.manifest build/manifest.rc build/icon.rc cfg/W
 add_executable(spicetools_spice_linux ${SOURCE_FILES} ${RESOURCE_FILES})
 target_link_libraries(spicetools_spice_linux
         PUBLIC d3d9 ws2_32 version comctl32 shlwapi iphlpapi hid secur32 setupapi psapi winmm winhttp
-        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features)
+        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features ${OPENSSL_LIBRARIES} OpenSSL::SSL crypt32)
 set_target_properties(spicetools_spice_linux PROPERTIES PREFIX "")
 set_target_properties(spicetools_spice_linux PROPERTIES OUTPUT_NAME "spice_linux")
 target_compile_definitions(spicetools_spice_linux PRIVATE NO_SCARD=1 PRIVATE SPICE_LINUX=1)
@@ -682,14 +736,22 @@ endif()
 
 set(RESOURCE_FILES build/manifest.manifest build/manifest64.rc build/icon.rc cfg/Win32D.rc)
 add_executable(spicetools_spice64 ${SOURCE_FILES} ${RESOURCE_FILES})
-
+target_include_directories(spicetools_spice64 PRIVATE ${OPENSSL_INCLUDE_DIR})
 # do NOT link against: mf, mfplat, mfreadwrite; otherwise unity games will break
 target_link_libraries(spicetools_spice64
         PUBLIC d3d9 ws2_32 version comctl32 shlwapi iphlpapi hid secur32 setupapi psapi winmm winhttp mfuuid strmiids dxva2
-        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features)
+        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features ${OPENSSL_LIBRARIES} OpenSSL::SSL ws2_32 crypt32 user32 advapi32 gdi32 secur32)
 target_link_libraries(spicetools_spice64 PUBLIC winscard)
+target_link_libraries(spicetools_spice64 PRIVATE
+    ${OPENSSL_SSL_LIBRARY}     
+    ${OPENSSL_CRYPTO_LIBRARY}  
+)
 set_target_properties(spicetools_spice64 PROPERTIES PREFIX "")
 set_target_properties(spicetools_spice64 PROPERTIES OUTPUT_NAME "spice64")
+set_target_properties(spicetools_spice64 PROPERTIES
+    LINK_SEARCH_START_STATIC ON
+    LINK_SEARCH_END_STATIC ON
+)
 target_compile_definitions(spicetools_spice64 PRIVATE SPICE64=1)
 
 IF(NOT MSVC)
@@ -705,7 +767,7 @@ add_executable(spicetools_spice64_linux ${SOURCE_FILES} ${RESOURCE_FILES})
 # do NOT link against: mf, mfplat, mfreadwrite; otherwise unity games will break
 target_link_libraries(spicetools_spice64_linux
         PUBLIC d3d9 ws2_32 version comctl32 shlwapi iphlpapi hid secur32 setupapi psapi winmm winhttp mfuuid strmiids dxva2
-        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features)
+        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features ${OPENSSL_LIBRARIES} OpenSSL::SSL crypt32)
 set_target_properties(spicetools_spice64_linux PROPERTIES PREFIX "")
 set_target_properties(spicetools_spice64_linux PROPERTIES OUTPUT_NAME "spice64_linux")
 target_compile_definitions(spicetools_spice64_linux PRIVATE SPICE64=1)
@@ -723,7 +785,7 @@ set(RESOURCE_FILES cfg/manifest.manifest cfg/manifest.rc cfg/icon.rc cfg/Win32D.
 add_executable(spicetools_cfg WIN32 ${SOURCE_FILES} ${RESOURCE_FILES})
 target_link_libraries(spicetools_cfg
         PUBLIC ws2_32 version comctl32 shlwapi iphlpapi hid secur32 setupapi psapi winmm winhttp strmiids
-        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features)
+        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features ${OPENSSL_LIBRARIES} OpenSSL::SSL ws2_32 crypt32)
 target_link_libraries(spicetools_cfg PUBLIC winscard)
 set_target_properties(spicetools_cfg PROPERTIES PREFIX "")
 set_target_properties(spicetools_cfg PROPERTIES OUTPUT_NAME "spicecfg")
@@ -741,7 +803,7 @@ set(RESOURCE_FILES cfg/manifest.manifest cfg/manifest.rc cfg/icon.rc cfg/Win32D.
 add_executable(spicetools_cfg_linux WIN32 ${SOURCE_FILES} ${RESOURCE_FILES})
 target_link_libraries(spicetools_cfg_linux
         PUBLIC ws2_32 version comctl32 shlwapi iphlpapi hid secur32 setupapi psapi winmm winhttp strmiids
-        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features)
+        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook imm32 dwmapi CpuFeatures::cpu_features ${OPENSSL_LIBRARIES} OpenSSL::SSL crypt32)
 set_target_properties(spicetools_cfg_linux PROPERTIES PREFIX "")
 set_target_properties(spicetools_cfg_linux PROPERTIES OUTPUT_NAME "spicecfg_linux")
 target_compile_definitions(spicetools_cfg_linux PRIVATE SPICETOOLS_SPICECFG_STANDALONE=1)
